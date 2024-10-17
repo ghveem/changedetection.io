@@ -1,14 +1,14 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
-from .util import set_original_response, set_modified_response, live_server_setup, wait_for_all_checks
+from .util import set_original_response, live_server_setup, wait_for_all_checks
 from flask import url_for
-from urllib.request import urlopen
+import io
 from zipfile import ZipFile
 import re
 import time
 
 
-def test_backup(client, live_server):
+def test_backup(client, live_server, measure_memory_usage):
     live_server_setup(live_server)
 
     set_original_response()
@@ -37,15 +37,10 @@ def test_backup(client, live_server):
     # Should be PK/ZIP stream
     assert res.data.count(b'PK') >= 2
 
-    # ZipFile from buffer seems non-obvious, just save it instead
-    with open("download.zip", 'wb') as f:
-        f.write(res.data)
-
-    zip = ZipFile('download.zip')
-    l = zip.namelist()
+    backup = ZipFile(io.BytesIO(res.data))
+    l = backup.namelist()
     uuid4hex = re.compile('^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}.*txt', re.I)
     newlist = list(filter(uuid4hex.match, l))  # Read Note below
 
     # Should be two txt files in the archive (history and the snapshot)
     assert len(newlist) == 2
-
