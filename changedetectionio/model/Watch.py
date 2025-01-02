@@ -89,6 +89,10 @@ class model(watch_base):
 
         if ready_url.startswith('source:'):
             ready_url=ready_url.replace('source:', '')
+
+        # Also double check it after any Jinja2 formatting just incase
+        if not is_safe_url(ready_url):
+            return 'DISABLED'
         return ready_url
 
     def clear_watch(self):
@@ -243,37 +247,32 @@ class model(watch_base):
         bump = self.history
         return self.__newest_history_key
 
-    # Given an arbitrary timestamp, find the closest next key
-    # For example, last_viewed = 1000 so it should return the next 1001 timestamp
-    #
-    # used for the [diff] button so it can preset a smarter from_version
+    # Given an arbitrary timestamp, find the best history key for the [diff] button so it can preset a smarter from_version
     @property
-    def get_next_snapshot_key_to_last_viewed(self):
+    def get_from_version_based_on_last_viewed(self):
 
         """Unfortunately for now timestamp is stored as string key"""
         keys = list(self.history.keys())
         if not keys:
             return None
+        if len(keys) == 1:
+            return keys[0]
 
         last_viewed = int(self.get('last_viewed'))
-        prev_k = keys[0]
         sorted_keys = sorted(keys, key=lambda x: int(x))
         sorted_keys.reverse()
 
-        # When the 'last viewed' timestamp is greater than the newest snapshot, return second last
-        if last_viewed > int(sorted_keys[0]):
+        # When the 'last viewed' timestamp is greater than or equal the newest snapshot, return second newest
+        if last_viewed >= int(sorted_keys[0]):
             return sorted_keys[1]
+        
+        # When the 'last viewed' timestamp is between snapshots, return the older snapshot
+        for newer, older in list(zip(sorted_keys[0:], sorted_keys[1:])):
+            if last_viewed < int(newer) and last_viewed >= int(older):
+                return older
 
-        for k in sorted_keys:
-            if int(k) < last_viewed:
-                if prev_k == sorted_keys[0]:
-                    # Return the second last one so we dont recommend the same version compares itself
-                    return sorted_keys[1]
-
-                return prev_k
-            prev_k = k
-
-        return keys[0]
+        # When the 'last viewed' timestamp is less than the oldest snapshot, return oldest
+        return sorted_keys[-1]
 
     def get_history_snapshot(self, timestamp):
         import brotli
@@ -335,7 +334,6 @@ class model(watch_base):
         # @todo bump static cache of the last timestamp so we dont need to examine the file to set a proper ''viewed'' status
         return snapshot_fname
 
-    @property
     @property
     def has_empty_checktime(self):
         # using all() + dictionary comprehension
@@ -534,16 +532,17 @@ class model(watch_base):
 
     def save_xpath_data(self, data, as_error=False):
         import json
+        import zlib
 
         if as_error:
-            target_path = os.path.join(self.watch_data_dir, "elements-error.json")
+            target_path = os.path.join(str(self.watch_data_dir), "elements-error.deflate")
         else:
-            target_path = os.path.join(self.watch_data_dir, "elements.json")
+            target_path = os.path.join(str(self.watch_data_dir), "elements.deflate")
 
         self.ensure_data_dir_exists()
 
-        with open(target_path, 'w') as f:
-            f.write(json.dumps(data))
+        with open(target_path, 'wb') as f:
+            f.write(zlib.compress(json.dumps(data).encode()))
             f.close()
 
     # Save as PNG, PNG is larger but better for doing visual diff in the future
