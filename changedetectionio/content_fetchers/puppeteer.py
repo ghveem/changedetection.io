@@ -6,8 +6,76 @@ from urllib.parse import urlparse
 
 from loguru import logger
 
+from changedetectionio.content_fetchers import SCREENSHOT_MAX_HEIGHT_DEFAULT, visualselector_xpath_selectors, \
+    SCREENSHOT_SIZE_STITCH_THRESHOLD, SCREENSHOT_DEFAULT_QUALITY, XPATH_ELEMENT_JS, INSTOCK_DATA_JS, \
+    SCREENSHOT_MAX_TOTAL_HEIGHT
 from changedetectionio.content_fetchers.base import Fetcher, manage_user_agent
-from changedetectionio.content_fetchers.exceptions import PageUnloadable, Non200ErrorCodeReceived, EmptyReply, BrowserFetchTimedOut, BrowserConnectError
+from changedetectionio.content_fetchers.exceptions import PageUnloadable, Non200ErrorCodeReceived, EmptyReply, BrowserFetchTimedOut, \
+    BrowserConnectError
+
+
+# Bug 3 in Playwright screenshot handling
+# Some bug where it gives the wrong screenshot size, but making a request with the clip set first seems to solve it
+
+# Screenshots also travel via the ws:// (websocket) meaning that the binary data is base64 encoded
+# which will significantly increase the IO size between the server and client, it's recommended to use the lowest
+# acceptable screenshot quality here
+async def capture_full_page(page):
+    import os
+    import time
+    from multiprocessing import Process, Pipe
+
+    start = time.time()
+
+    page_height = await page.evaluate("document.documentElement.scrollHeight")
+    page_width = await page.evaluate("document.documentElement.scrollWidth")
+    original_viewport = page.viewport
+
+    logger.debug(f"Puppeteer viewport size {page.viewport} page height {page_height} page width {page_width}")
+
+    # Bug 3 in Playwright screenshot handling
+    # Some bug where it gives the wrong screenshot size, but making a request with the clip set first seems to solve it
+    # JPEG is better here because the screenshots can be very very large
+
+    # Screenshots also travel via the ws:// (websocket) meaning that the binary data is base64 encoded
+    # which will significantly increase the IO size between the server and client, it's recommended to use the lowest
+    # acceptable screenshot quality here
+
+
+    step_size = SCREENSHOT_SIZE_STITCH_THRESHOLD # Something that will not cause the GPU to overflow when taking the screenshot
+    screenshot_chunks = []
+    y = 0
+    if page_height > page.viewport['height']:
+        await page.setViewport({'width': page.viewport['width'], 'height': step_size})
+
+
+    while y < min(page_height, SCREENSHOT_MAX_TOTAL_HEIGHT):
+        await page.evaluate(f"window.scrollTo(0, {y})")
+        screenshot_chunks.append(await page.screenshot(type_='jpeg',
+                                                       fullPage=False,
+                                                       quality=int(os.getenv("SCREENSHOT_QUALITY", 72))))
+        y += step_size
+
+    await page.setViewport({'width': original_viewport['width'], 'height': original_viewport['height']})
+
+    if len(screenshot_chunks) > 1:
+        from changedetectionio.content_fetchers.screenshot_handler import stitch_images_worker
+        logger.debug(f"Screenshot stitching {len(screenshot_chunks)} chunks together")
+        parent_conn, child_conn = Pipe()
+        p = Process(target=stitch_images_worker, args=(child_conn, screenshot_chunks, page_height, SCREENSHOT_MAX_TOTAL_HEIGHT))
+        p.start()
+        screenshot = parent_conn.recv_bytes()
+        p.join()
+        logger.debug(
+            f"Screenshot (chunked/stitched) - Page height: {page_height} Capture height: {SCREENSHOT_MAX_TOTAL_HEIGHT} - Stitched together in {time.time() - start:.2f}s")
+
+        screenshot_chunks = None
+        return screenshot
+
+    logger.debug(
+        f"Screenshot Page height: {page_height} Capture height: {SCREENSHOT_MAX_TOTAL_HEIGHT} - Stitched together in {time.time() - start:.2f}s")
+    return screenshot_chunks[0]
+
 
 class fetcher(Fetcher):
     fetcher_description = "Puppeteer/direct {}/Javascript".format(
@@ -79,7 +147,6 @@ class fetcher(Fetcher):
                          empty_pages_are_a_change
                          ):
 
-        from changedetectionio.content_fetchers import visualselector_xpath_selectors
         self.delete_browser_steps_screenshots()
         extra_wait = int(os.getenv("WEBDRIVER_DELAY_BEFORE_CONTENT_READY", 5)) + self.render_extract_delay
 
@@ -181,11 +248,10 @@ class fetcher(Fetcher):
             raise PageUnloadable(url=url, status_code=None, message=str(e))
 
         if self.status_code != 200 and not ignore_status_codes:
-            screenshot = await self.page.screenshot(type_='jpeg',
-                                                    fullPage=True,
-                                                    quality=int(os.getenv("SCREENSHOT_QUALITY", 72)))
+            screenshot = await capture_full_page(page=self.page)
 
             raise Non200ErrorCodeReceived(url=url, status_code=self.status_code, screenshot=screenshot)
+
         content = await self.page.content
 
         if not empty_pages_are_a_change and len(content.strip()) == 0:
@@ -203,46 +269,31 @@ class fetcher(Fetcher):
 
         # So we can find an element on the page where its selector was entered manually (maybe not xPath etc)
         # Setup the xPath/VisualSelector scraper
-        if current_include_filters is not None:
+        if current_include_filters:
             js = json.dumps(current_include_filters)
             await self.page.evaluate(f"var include_filters={js}")
         else:
             await self.page.evaluate(f"var include_filters=''")
 
-        self.xpath_data = await self.page.evaluate(
-            "async () => {" + self.xpath_element_js.replace('%ELEMENTS%', visualselector_xpath_selectors) + "}")
-        self.instock_data = await self.page.evaluate("async () => {" + self.instock_data_js + "}")
+        MAX_TOTAL_HEIGHT = int(os.getenv("SCREENSHOT_MAX_HEIGHT", SCREENSHOT_MAX_HEIGHT_DEFAULT))
+        self.xpath_data = await self.page.evaluate(XPATH_ELEMENT_JS, {
+            "visualselector_xpath_selectors": visualselector_xpath_selectors,
+            "max_height": MAX_TOTAL_HEIGHT
+        })
+        if not self.xpath_data:
+            raise Exception(f"Content Fetcher > xPath scraper failed. Please report this URL so we can fix it :)")
+
+        self.instock_data = await self.page.evaluate(INSTOCK_DATA_JS)
 
         self.content = await self.page.content
-        # Bug 3 in Playwright screenshot handling
-        # Some bug where it gives the wrong screenshot size, but making a request with the clip set first seems to solve it
-        # JPEG is better here because the screenshots can be very very large
 
-        # Screenshots also travel via the ws:// (websocket) meaning that the binary data is base64 encoded
-        # which will significantly increase the IO size between the server and client, it's recommended to use the lowest
-        # acceptable screenshot quality here
-        try:
-            self.screenshot = await self.page.screenshot(type_='jpeg',
-                                                         fullPage=True,
-                                                         quality=int(os.getenv("SCREENSHOT_QUALITY", 72)))
-        except Exception as e:
-            logger.error("Error fetching screenshot")
-            # // May fail on very large pages with 'WARNING: tile memory limits exceeded, some content may not draw'
-            # // @ todo after text extract, we can place some overlay text with red background to say 'croppped'
-            logger.error('ERROR: content-fetcher page was maybe too large for a screenshot, reverting to viewport only screenshot')
-            try:
-                self.screenshot = await self.page.screenshot(type_='jpeg',
-                                                             fullPage=False,
-                                                             quality=int(os.getenv("SCREENSHOT_QUALITY", 72)))
-            except Exception as e:
-                logger.error('ERROR: Failed to get viewport-only reduced screenshot :(')
-                pass
-        finally:
-            # It's good to log here in the case that the browser crashes on shutting down but we still get the data we need
-            logger.success(f"Fetching '{url}' complete, closing page")
-            await self.page.close()
-            logger.success(f"Fetching '{url}' complete, closing browser")
-            await browser.close()
+        self.screenshot = await capture_full_page(page=self.page)
+
+        # It's good to log here in the case that the browser crashes on shutting down but we still get the data we need
+        logger.success(f"Fetching '{url}' complete, closing page")
+        await self.page.close()
+        logger.success(f"Fetching '{url}' complete, closing browser")
+        await browser.close()
         logger.success(f"Fetching '{url}' complete, exiting puppeteer fetch.")
 
     async def main(self, **kwargs):

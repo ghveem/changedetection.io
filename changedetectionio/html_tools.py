@@ -366,22 +366,41 @@ def extract_json_as_string(content, json_filter, ensure_is_ldjson_info_type=None
 # wordlist - list of regex's (str) or words (str)
 # Preserves all linefeeds and other whitespacing, its not the job of this to remove that
 def strip_ignore_text(content, wordlist, mode="content"):
-    i = 0
-    output = []
     ignore_text = []
     ignore_regex = []
-    ignored_line_numbers = []
+    ignore_regex_multiline = []
+    ignored_lines = []
 
     for k in wordlist:
         # Is it a regex?
         res = re.search(PERL_STYLE_REGEX, k, re.IGNORECASE)
         if res:
-            ignore_regex.append(re.compile(perl_style_slash_enclosed_regex_to_options(k)))
+            res = re.compile(perl_style_slash_enclosed_regex_to_options(k))
+            if res.flags & re.DOTALL or res.flags & re.MULTILINE:
+                ignore_regex_multiline.append(res)
+            else:
+                ignore_regex.append(res)
         else:
             ignore_text.append(k.strip())
 
-    for line in content.splitlines(keepends=True):
-        i += 1
+    for r in ignore_regex_multiline:
+        for match in r.finditer(content):
+            content_lines = content[:match.end()].splitlines(keepends=True)
+            match_lines = content[match.start():match.end()].splitlines(keepends=True)
+
+            end_line = len(content_lines)
+            start_line = end_line - len(match_lines)
+
+            if end_line - start_line <= 1:
+                # Match is empty or in the middle of the line
+                ignored_lines.append(start_line)
+            else:
+                for i in range(start_line, end_line):
+                    ignored_lines.append(i)
+
+    line_index = 0
+    lines = content.splitlines(keepends=True)
+    for line in lines:
         # Always ignore blank lines in this mode. (when this function gets called)
         got_match = False
         for l in ignore_text:
@@ -393,17 +412,19 @@ def strip_ignore_text(content, wordlist, mode="content"):
                 if r.search(line):
                     got_match = True
 
-        if not got_match:
-            # Not ignored, and should preserve "keepends"
-            output.append(line)
-        else:
-            ignored_line_numbers.append(i)
+        if got_match:
+            ignored_lines.append(line_index)
+
+        line_index += 1
+
+    ignored_lines = set([i for i in ignored_lines if i >= 0 and i < len(lines)])
 
     # Used for finding out what to highlight
     if mode == "line numbers":
-        return ignored_line_numbers
+        return [i + 1 for i in ignored_lines]
 
-    return ''.join(output)
+    output_lines = set(range(len(lines))) - ignored_lines
+    return ''.join([lines[i] for i in output_lines])
 
 def cdata_in_document_to_text(html_content: str, render_anchor_tag_content=False) -> str:
     from xml.sax.saxutils import escape as xml_escape
@@ -414,7 +435,9 @@ def cdata_in_document_to_text(html_content: str, render_anchor_tag_content=False
 
     return re.sub(pattern, repl, html_content)
 
-def html_to_text(html_content: str, render_anchor_tag_content=False, is_rss=False) -> str:
+
+def html_to_text_sub_worker(conn, html_content: str, render_anchor_tag_content=False, is_rss=False):
+
     from inscriptis import get_text
     from inscriptis.model.config import ParserConfig
 
@@ -449,15 +472,27 @@ def html_to_text(html_content: str, render_anchor_tag_content=False, is_rss=Fals
         html_content = re.sub(r'</title>', r'</h1>', html_content)
 
     text_content = get_text(html_content, config=parser_config)
+    conn.send(text_content)
+    conn.close()
 
-    return text_content
+# NOTE!! ANYTHING LIBXML, HTML5LIB ETC WILL CAUSE SOME SMALL MEMORY LEAK IN THE LOCAL "LIB" IMPLEMENTATION OUTSIDE PYTHON
+def html_to_text(html_content: str, render_anchor_tag_content=False, is_rss=False):
+    from multiprocessing import Process, Pipe
 
+    parent_conn, child_conn = Pipe()
+    p = Process(target=html_to_text_sub_worker, args=(child_conn, html_content, render_anchor_tag_content, is_rss))
+    p.start()
+    text = parent_conn.recv()
+    p.join()
+    return text
 
 # Does LD+JSON exist with a @type=='product' and a .price set anywhere?
 def has_ldjson_product_info(content):
     try:
-        lc = content.lower()
-        if 'application/ld+json' in lc and lc.count('"price"') == 1 and '"pricecurrency"' in lc:
+        # Better than .lower() which can use a lot of ram
+        if (re.search(r'application/ld\+json', content, re.IGNORECASE) and
+            re.search(r'"price"', content, re.IGNORECASE) and
+            re.search(r'"pricecurrency"', content, re.IGNORECASE)):
             return True
 
 #       On some pages this is really terribly expensive when they dont really need it
